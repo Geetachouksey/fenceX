@@ -1,0 +1,228 @@
+import network
+import machine
+import utime
+import math
+import urequests
+import json
+
+# WiFi credentials
+SSID = "Zee"
+PASSWORD = "Zee12345"
+
+# Google Apps Script Web App URL
+WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwt4ZtViNx8nYY3NdVD8tBZ_JlcnCqrawVRit1fnMn-r3tF08bWwwaVMzHc-GsDcktQBQ/exec"
+
+# ADC setup
+adc_current = machine.ADC(26)
+adc_voltage = machine.ADC(27)
+conversion_factor = 3.3 / 65535
+
+# Calibration factors
+CURRENT_CAL = 15.0
+VOLTAGE_CAL = 230.0
+
+# Data buffer for offline storage
+data_buffer = []
+MAX_BUFFER_SIZE = 50
+
+# LED for status indication (optional)
+led = machine.Pin("LED", machine.Pin.OUT)
+
+def connect_wifi():
+    """Connect to WiFi with retry logic"""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    
+    if wlan.isconnected():
+        print("Already connected:", wlan.ifconfig())
+        return wlan
+    
+    print("Connecting to WiFi:", SSID)
+    wlan.connect(SSID, PASSWORD)
+    
+    max_wait = 20
+    while max_wait > 0:
+        if wlan.isconnected():
+            print("Connected successfully!")
+            print("IP:", wlan.ifconfig()[0])
+            return wlan
+        max_wait -= 1
+        print("Waiting for connection...")
+        led.toggle()
+        utime.sleep(1)
+    
+    print("Failed to connect to WiFi")
+    return None
+
+def read_rms(samples=500):
+    """Read RMS values from ADC sensors"""
+    sum_sq_current = 0
+    sum_sq_voltage = 0
+    
+    for _ in range(samples):
+        raw_current = adc_current.read_u16() * conversion_factor
+        raw_voltage = adc_voltage.read_u16() * conversion_factor
+        
+        # Center around 1.65V (assuming 3.3V/2 bias)
+        centered_current = raw_current - 1.65
+        centered_voltage = raw_voltage - 1.65
+        
+        sum_sq_current += centered_current ** 2
+        sum_sq_voltage += centered_voltage ** 2
+        
+        utime.sleep_us(20)
+    
+    irms = math.sqrt(sum_sq_current / samples) * CURRENT_CAL
+    vrms = math.sqrt(sum_sq_voltage / samples) * VOLTAGE_CAL
+    power = irms * vrms
+    
+    return round(irms, 2), round(vrms, 2), round(power, 2)
+
+def send_data(current, voltage, power):
+    """Send data to Google Sheets via POST request"""
+    payload = {
+        "current": current,
+        "voltage": voltage,
+        "power": power
+    }
+    
+    try:
+        response = urequests.post(
+            WEB_APP_URL,
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps(payload),
+            timeout=10
+        )
+        
+        status = response.status_code
+        text = response.text
+        response.close()
+        
+        if status == 200:
+            print("✓ Data sent successfully")
+            led.on()
+            utime.sleep(0.1)
+            led.off()
+            return True
+        else:
+            print(f"✗ Server returned status {status}: {text}")
+            return False
+            
+    except Exception as e:
+        print(f"✗ Error sending data: {e}")
+        return False
+
+def send_buffered_data(wlan):
+    """Attempt to send any buffered data"""
+    global data_buffer
+    
+    if not data_buffer:
+        return
+    
+    if not wlan.isconnected():
+        print("Not connected - keeping data in buffer")
+        return
+    
+    print(f"Attempting to send {len(data_buffer)} buffered readings...")
+    
+    sent_count = 0
+    failed_data = []
+    
+    for data in data_buffer:
+        if send_data(data['current'], data['voltage'], data['power']):
+            sent_count += 1
+            utime.sleep(0.5)  # Small delay between sends
+        else:
+            failed_data.append(data)
+    
+    data_buffer = failed_data
+    
+    if sent_count > 0:
+        print(f"✓ Sent {sent_count} buffered readings")
+    
+    if data_buffer:
+        print(f"⚠ {len(data_buffer)} readings still in buffer")
+
+def main():
+    """Main loop"""
+    global data_buffer
+    
+    # Connect to WiFi
+    wlan = connect_wifi()
+    
+    if not wlan:
+        print("Cannot proceed without WiFi. Retrying in 30 seconds...")
+        utime.sleep(30)
+        machine.reset()
+    
+    print("\n=== Starting sensor data collection ===\n")
+    led.on()
+    utime.sleep(1)
+    led.off()
+    
+    while True:
+        try:
+            # Read sensor values
+            irms, vrms, power = read_rms()
+            
+            print(f"Irms={irms:.2f}A | Vrms={vrms:.2f}V | Power={power:.2f}W")
+            
+            # Check WiFi connection
+            if not wlan.isconnected():
+                print("WiFi disconnected! Reconnecting...")
+                wlan = connect_wifi()
+                
+                if not wlan:
+                    print("Reconnection failed. Buffering data...")
+                    # Add to buffer
+                    if len(data_buffer) < MAX_BUFFER_SIZE:
+                        data_buffer.append({
+                            "current": irms,
+                            "voltage": vrms,
+                            "power": power
+                        })
+                        print(f"⚠ Buffered ({len(data_buffer)}/{MAX_BUFFER_SIZE})")
+                    else:
+                        print("⚠ Buffer full! Dropping oldest data")
+                        data_buffer.pop(0)
+                        data_buffer.append({
+                            "current": irms,
+                            "voltage": vrms,
+                            "power": power
+                        })
+                    
+                    utime.sleep(5)
+                    continue
+            
+            # Send current reading
+            success = send_data(irms, vrms, power)
+            
+            # If successful and we have buffered data, try to send it
+            if success and data_buffer:
+                send_buffered_data(wlan)
+            
+            # If sending failed, buffer the data
+            elif not success:
+                if len(data_buffer) < MAX_BUFFER_SIZE:
+                    data_buffer.append({
+                        "current": irms,
+                        "voltage": vrms,
+                        "power": power
+                    })
+                    print(f"⚠ Buffered ({len(data_buffer)}/{MAX_BUFFER_SIZE})")
+            
+            utime.sleep(1)
+            
+        except KeyboardInterrupt:
+            print("\n\nStopping data collection...")
+            led.off()
+            break
+            
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            led.off()
+            utime.sleep(5)
+
+# Run the main program
+if __name__ == "__main__":
+    main()
